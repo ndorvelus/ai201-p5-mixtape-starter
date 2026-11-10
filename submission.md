@@ -2,14 +2,7 @@
 
 ## AI usage
 
-<!--
-To fill in. The rubric asks for:
-- At least 2 specific uses of AI during codebase navigation or debugging: what was asked, and what it helped explain or trace.
-- At least one time you verified something the AI explained, or where its output was incomplete and you had to course-correct.
-- Enough detail to tell real collaboration apart from "I used AI to help with code."
--->
-
-_To be written._
+I used Claude Code, an AI coding agent working in my repo, to read the codebase and trace call chains, such as `POST /songs/<id>/rate` from the route down to the database, which became the data flow in section 2. While debugging, it compiled the Issue #3 search query to SQL, which showed one row per tag, and it wrote scripts that froze `datetime.now()` so I could reproduce the Sunday-only (#1) and "until the same time the next day" (#2) bugs. Its output was not always right: one search edit applied only halfway and left a `NameError` that the test run caught before committing, and its first codebase map named bugs, which we rewrote after checking it against the grading rubric. Every fix was verified against the full test suite, including regression tests that were run first to confirm they failed on the buggy code, and against reproductions through the real routes.
 
 ---
 
