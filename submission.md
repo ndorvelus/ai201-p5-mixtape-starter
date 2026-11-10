@@ -136,7 +136,7 @@ if not x:
 
 ## 4. Root cause analysis
 
-I chose Issues **#1, #3 and #5**. All three have a specific, repeatable trigger in the seed data, and each one has a unit test that already fails because of it.
+I fixed all five issues. I started with **#1, #3 and #5**, because each one has a specific, repeatable trigger and a unit test that already fails because of it. Then I fixed **#2 and #4** as stretch work. Neither of those had a test, so I wrote regression tests for them (see section 5).
 
 **Setup used for every reproduction:**
 - I seeded a separate SQLite file by setting `DATABASE_URL` to a scratch path and running `seed_data.seed()`, so the real `instance/mixtape.db` was not touched.
@@ -184,6 +184,43 @@ I chose Issues **#1, #3 and #5**. All three have a specific, repeatable trigger 
   So the "skipped day resets" and "same day doesn't double count" rules still hold.
 
 **Commit:** `6f72599 fix: stop resetting listening streak on Sundays`
+
+### Issue #2: Friends Listening Now shows people from yesterday
+
+**How I reproduced it:**
+- **Data condition:** a friend whose most recent listen was yesterday evening, checked the next morning. The seed timestamps are relative to the real clock, so I cleared `ListeningEvent` in a scratch copy of the seeded DB and inserted events at fixed times for nova's friends. Then I froze `datetime.now()` inside `services/feed_service.py`.
+- **Steps:**
+  1. Inserted three listens: darius on Monday 2024-06-10 at 23:00 (the "11pm last night" from the report), simone on Tuesday at 08:30, and kenji on Monday at 07:00 (26 hours earlier, as a control).
+  2. Froze "now" at Tuesday 09:00 and called `GET /feed/<nova_id>/listening-now`.
+  3. Repeated the call with "now" frozen at Tuesday 22:59.
+- **Result:**
+
+  | "Now" | Expected friends | Actual friends |
+  |---|---|---|
+  | Tue 09:00 | simone | simone, **darius** ❌ |
+  | Tue 22:59 | simone | simone, **darius** ❌ |
+
+  kenji, at 26 hours old, was correctly left out both times. darius only drops off after 23:00 on Tuesday, exactly 24 hours after his listen. That matches nova's description: "Stuff from yesterday evening keeps hanging around in the feed until the same time the next day."
+
+**How I found the root cause:**
+1. `GET /feed/<id>/listening-now` → `feed.listening_now` (`routes/feed.py:9`) → `feed_service.get_friends_listening_now(user_id)`. The route just wraps the list with a count, so the filtering happens in the service.
+2. In the service, the only time filter is `ListeningEvent.listened_at >= cutoff`, with `cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD` (line 32). `RECENT_THRESHOLD` is defined at line 13 as `timedelta(hours=24)`.
+3. The kenji control told me the filter itself runs correctly: a 26-hour-old event really is excluded. The problem is how wide the window is. The moment I was sure was the 22:59 run. A 9pm listen still showing the next evening is only possible with a rolling 24-hour window, and the report's "until the same time the next day" describes exactly that.
+
+**Root cause:** `get_friends_listening_now` treats "recent" as "within the last 24 hours" (`cutoff = now - timedelta(hours=24)`). The feature is supposed to show who has listened *today*, which is a calendar boundary that resets at midnight. A rolling 24-hour window doesn't reset at midnight. Each listen stays visible for a full day after it happened, so a listen at 23:00 Monday sits in the feed until 23:00 Tuesday and shows up as "listening now" all of Tuesday morning. The bug only shows for listens from the previous calendar day that are less than 24 hours old, which is why it looked like "yesterday's stuff hanging around."
+
+**Fix:** I changed the cutoff to the start of the current day: `datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)`. I removed the now-unused `RECENT_THRESHOLD` constant and `timedelta` import, and updated the docstring to say "since midnight UTC." The day boundary is UTC because the whole app stores and compares time in UTC (`models.py` defaults, `streak_service`), and `User` has no time zone field to localize with.
+
+**Side-effect check:**
+- **Both sides of the boundary:** with "now" at Tuesday 00:00:30, a listen at Monday 23:59:59 is excluded and a listen at Tuesday 00:00:00 is included. This also confirms the aware `cutoff` compares correctly against the naive datetimes SQLite returns. That comparison was the riskiest part of the change, since SQLite drops `tzinfo`.
+- **Late in the same day:** a listen at 08:30 still shows at 22:59. The fix doesn't shorten the window within a day.
+- **One entry per friend:** the "most recent song per friend" dedup loop is unchanged. A new test with two listens by simone today returns one entry, the newer one.
+- **Activity feed:** `get_activity_feed` never used the cutoff, and it still returns every friend event (count 2 in the reproduction).
+- **Edge responses:** a user whose friends have no listens today gets `200` with `count: 0`, and an unknown user still gets `404`.
+- **Known limitation:** "today" is a UTC day. For a user in New York, the feed resets at 8pm EDT, not at local midnight. Fixing that needs a per-user time zone, which the data model doesn't have, so I left it out of scope.
+- `pytest`: the full suite passes.
+
+**Commit:** see `git log`, `fix: limit Friends Listening Now to listens since midnight`
 
 ### Issue #3: The same song appears multiple times in search
 
