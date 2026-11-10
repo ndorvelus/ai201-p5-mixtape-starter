@@ -306,7 +306,7 @@ The duplicates were hidden before commit `dc87e8c`, because the legacy `db.sessi
 - **Result:**
   - Before the add, the API returned `count: 6`, ending at "Crown Heights Anthem". "Harlem Renaissance" (position 7) was missing.
   - After the add, the API returned `count: 7`. "Harlem Renaissance" now appeared, and the new song "Frequencies" (position 8) was hidden. This is the "adding a song frees the previous one" behavior from the report.
-- **Note on step 3:** adding the song through the API (`POST /playlists/<id>/songs`) returns **500** with `IntegrityError: NOT NULL constraint failed: playlist_entries.position`. `add_to_playlist` uses `playlist.songs.append(song)`, which never sets `position` or `added_by`. That is a separate bug (see section 5). To finish the reproduction, I inserted the 8th entry directly with `playlist_entries.insert()`, the same way `seed_data.py` does.
+- **Note on step 3:** adding the song through the API (`POST /playlists/<id>/songs`) returns **500** with `IntegrityError: NOT NULL constraint failed: playlist_entries.position`. `add_to_playlist` uses `playlist.songs.append(song)`, which never sets `position` or `added_by`. That is a separate bug (see section 6). To finish the reproduction, I inserted the 8th entry directly with `playlist_entries.insert()`, the same way `seed_data.py` does.
 - **Test confirmation:** `tests/test_playlists.py::test_playlist_returns_all_songs` (expects 5, gets 4) and `test_playlist_returns_songs_in_order` both fail.
 
 **Trace from symptom to cause:**
@@ -322,6 +322,29 @@ The duplicates were hidden before commit `dc87e8c`, because the legacy `db.sessi
 - Reran the reproduction. "Friday Energy" returns 7/7 songs, ending with "Harlem Renaissance". After the 8th song is added, it returns 8/8, ending with the new song "Frequencies".
 - Compared the API count to the `playlist_entries` row count for every seeded playlist. Late Night Vibes is 7/7, Friday Energy 8/8 and Study Mode 7/7.
 - `GET /playlists/<id>` (metadata) still returns 200, and an unknown playlist ID still returns 404.
-- **Not fixed (out of scope):** adding a song through `POST /playlists/<id>/songs` still returns 500 because of the separate `playlist_entries` NOT NULL bug described in section 5. This fix only changes how songs are read back.
+- **Not fixed (out of scope):** adding a song through `POST /playlists/<id>/songs` still returns 500 because of the separate `playlist_entries` NOT NULL bug described in section 6. This fix only changes how songs are read back.
 
 **Commit:** `d4d08e3 fix: return the last song in playlist results`
+
+---
+
+## 5. Regression tests
+
+The starter repo already had failing tests for Issues #1, #3 and #5. Issues #2 and #4 had no tests at all: `tests/` had nothing for the feed or for notifications. I wrote two new test files for them. Both follow the existing pattern: an in-memory SQLite `app` fixture, with the service functions called directly.
+
+**`tests/test_feed.py` (Issue #2).** The tests swap `feed_service.datetime` for a subclass whose `now()` is fixed (Tuesday 2024-06-11, 09:00 UTC), so results don't depend on when the suite runs.
+- `test_listen_from_last_night_is_not_listening_now`: darius listened Monday at 23:00 and simone Tuesday at 08:30, so at 09:00 only simone appears. **Against the buggy code this failed** with `['simone', 'darius'] != ['simone']`, because darius's listen was still inside the rolling 24-hour window. This is the exact scenario from nova's report.
+- `test_midnight_is_the_boundary`: at Tuesday 00:00:30, a listen at Monday 23:59:59 is excluded and one at Tuesday 00:00:00 is included. **This also failed against the buggy code**, because the 24-hour window included both.
+- `test_listen_from_earlier_today_still_shows_late_in_the_day` and `test_only_latest_song_per_friend`: guard tests. They passed before and after the fix, and they make sure the fix doesn't over-correct by dropping same-day listens or the one-entry-per-friend behavior.
+
+**`tests/test_notifications.py` (Issue #4).**
+- `test_rating_notifies_the_sharer`: kenji rates aaliya's song, and aaliya ends up with exactly one `song_rated` notification that names kenji and the song. **Against the buggy code this failed** with `assert 0 == 1`, because `rate_song` never called `create_notification`.
+- `test_rating_your_own_song_does_not_notify` and `test_invalid_rating_does_not_notify`: guard tests for the self-rating rule and for a rejected score of 9.
+
+I wrote both files *before* changing either service and ran them first. The result was 3 failed and 4 passed, and the 3 failures were exactly the bug-capturing tests above. After the two fixes, the full suite passes: **20 passed**, including the original 13.
+
+---
+
+## 6. Other findings (not fixed)
+
+**`POST /playlists/<id>/songs` returns 500.** `playlist_entries` declares `position` and `added_by` as `NOT NULL`, but `add_to_playlist` adds songs through the plain `secondary=` relationship (`playlist.songs.append(song)`), which can't fill those columns. Running it against an in-memory DB fails with `IntegrityError: NOT NULL constraint failed: playlist_entries.position`. This affects the Issue #5 reproduction (step 3). It isn't one of the five listed issues, so I left it alone. A fix would insert into `playlist_entries` directly with the next `position` and the `added_by` user, the way `seed_data.py` does.
