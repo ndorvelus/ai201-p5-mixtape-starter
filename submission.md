@@ -264,6 +264,37 @@ The duplicates were hidden before commit `dc87e8c`, because the legacy `db.sessi
 
 **Commit:** `2959ec0 fix: remove unused song_tags join that duplicated search results`
 
+### Issue #4: No notification when a friend rates your song
+
+**How I reproduced it:**
+- **Data condition:** a song shared by one user and rated by a different user. Seed data covers this: "Midnight Drive" is shared by nova, and nova already has one working notification ("darius added your song 'Midnight Drive' to the playlist 'Late Night Vibes'"), which is the control from aaliya's report.
+- **Steps:**
+  1. `GET /users/<nova_id>/notifications`: count **1**.
+  2. `POST /songs/<midnight_drive_id>/rate` with `{"user_id": kenji, "score": 5}` returned **201** with the saved rating.
+  3. `GET /users/<nova_id>/notifications` again: still count **1**, holding only the playlist notification.
+- **Result:** the rating is saved, just as the report says, but no notification of any kind is created. The notifications endpoint works, because it shows the seeded playlist notification, so the rating notification was never written in the first place.
+
+**How I found the root cause:**
+1. `POST /songs/<id>/rate` → `songs.rate` (`routes/songs.py:29`) → `notification_service.rate_song(user_id, song_id, score)`. The route doesn't touch notifications at all, so if one is created, `rate_song` has to do it.
+2. I checked the read side first: `GET /users/<id>/notifications` → `get_notifications`, which just queries `Notification` by `user_id`. It returned the seeded row, so reading isn't the problem.
+3. Following the hint about the working path, I put `add_to_playlist` (lines 35–70) and `rate_song` (lines 73–110) side by side. They have the same structure: validate inputs, look up `Song` and `User`, write, then `db.session.commit()`. After its commit, `add_to_playlist` has one more block: `if song.shared_by != added_by_user_id: create_notification(...)`. `rate_song` goes straight from `commit()` to `return rating`.
+4. The moment I was sure was `git grep create_notification`. It has exactly **one** call site, in `add_to_playlist`, but its own docstring lists `'song_rated'` as a notification type. Nothing in the codebase ever produces that type.
+
+**Root cause:** notifications in Mixtape are not automatic side effects of writing data. There is no model event, signal, or listener that reacts to a new `Rating` or playlist entry. Each action has to call `create_notification` explicitly, and `add_to_playlist` does. `rate_song` saves the `Rating` and returns without ever making that call, so the code path that would create a `'song_rated'` notification doesn't exist. That's why it fails for every user, every time, with no delay or partial result: the rating write succeeds and the notification step was never written.
+
+**Fix:** after the rating is committed, `rate_song` now runs the same guarded block as `add_to_playlist`. If the rater is not the person who shared the song, it calls `create_notification(user_id=song.shared_by, notification_type="song_rated", body=f"{rater.username} rated your song '{song.title}' {score} out of 5.")`. I placed it after the commit and after all validation, so a rejected rating can never leave a notification behind. I followed the existing pattern rather than adding a general event system, which would be a much larger change than this bug needs.
+
+**Side-effect check:**
+- **Rating response unchanged:** `POST /songs/<id>/rate` still returns `201` with the rating, and the score is still saved.
+- **Self-rating:** nova rating her own song creates no notification (count stays the same). This matches the "not the sharer" rule from `add_to_playlist`.
+- **Invalid score:** a score of 9 still returns `400`, and no notification is created, because validation raises before the notify step runs.
+- **Re-rating:** kenji changing his rating from 5 to 3 updates the existing `Rating` row (the upsert still works) and sends a new notification with the new score. I chose this on purpose: a changed rating is new information for the sharer.
+- **Existing notifications:** the seeded playlist notification is still returned, newest first, after the new rating notification.
+- **Transactions:** like `add_to_playlist`, the rating and the notification are two separate commits, because `create_notification` commits on its own. I kept that to match the existing pattern instead of changing `create_notification` for both callers.
+- `pytest`: the full suite passes.
+
+**Commit:** see `git log`, `fix: notify song sharer when a friend rates their song`
+
 ### Issue #5: The last song in a playlist never shows up
 
 **How I reproduced it:**
